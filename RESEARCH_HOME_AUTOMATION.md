@@ -4,7 +4,7 @@
 **База:** `DroneBridge-for-ESP32-Arduino-mode` v2.4.1 (ESP-IDF 5.4.4, chip ESP32/C3/C6/S2/S3), ветка `master` @ `ed1b9ef`  
 **Цель:** ответить на заметки — можно ли быстро взять DroneBridge как радиоканал для датчиков: опрос → MQTT, загрузка профилей/скриптов, MQTT → broadcast, своё ядро + обновление по воздуху.
 
-> TL;DR для спешащих — **DroneBridge как готовый “радиомост” очень хорош для 1–2 недель MVP**, но **как полноценная платформа домашней автоматики — потребует форка и переработки**. Быстрее всего завести канал: оставить DroneBridge в режиме `Transparent` (TCP 5760 / UDP 14550 / ESP-NOW) и повесить MQTT-шлюз на одной ноде-GND (малине/ESP32-GND). Нативный MQTT-клиент внутри каждой ноды, файловую систему для скриптов и OTA придётся дописывать. В open-source ветке OTA сознательно отсутствует — OTA есть только в платной DLSE; для open-source придётся ввести OTA-раздел самостоятельно.
+> TL;DR для спешащих — **DroneBridge как готовый “радиомост” очень хорош для 1–2 недель MVP**, но **как полноценная платформа домашней автоматики — потребует форка и переработки**. Быстрее всего завести канал: ESP-NOW AIR/GND в `Transparent` и MQTT-шлюз на ESP32-GND как часть Hybrid Core либо внешний шлюз через UART GND; TCP 5760/UDP 14550 существуют в режимах Wi-Fi AP/STA, **не в ESP-NOW**. Нативный MQTT-клиент внутри ESP-NOW-GND требует переделки Wi-Fi init под одноканальное STA+ESP-NOW; файловую систему для скриптов и OTA придётся проектировать отдельно. В open-source ветке OTA сознательно отсутствует — OTA есть только в платной DLSE; для open-source придётся ввести OTA-раздел самостоятельно.
 
 ---
 
@@ -15,19 +15,17 @@
 **Архитектура (упрощённо):**
 
 ```
-[Датчик/FC] --UART/JTAG--> [ESP32 DroneBridge] --WiFi/ESP-NOW/BLE--> [ESP32 GND] --TCP 5760 / UDP 14550--> [QGC / твой gateway]
-                                 |                        |
-                                 +-- HTTP 80 /api/* ------+-- web-конфигуратор (SPIFFS /www = 192KB)
-                                 +-- NVS settings --------+-- 27 параметров (ssid/pass/channel/proto/pack_size...)
-                                 +-- mDNS dronebridge.local
+ESP-NOW: [датчик/FC] --UART--> [ESP32 AIR] --ESP-NOW broadcast--> [ESP32 GND] --UART--> [шлюз MQTT]
+Wi-Fi:   [датчик/FC] --UART--> [ESP32 STA/AP] --TCP 5760 / UDP 14550--> [шлюз MQTT/GCS]
+HTTP /api/* и mDNS доступны только в некоторых Wi-Fi/BLE режимах, не в ESP-NOW; параметры — NVS.
 ```
 
 - **Режимы** `SYS_ESP32_MODE`: 1 AP, 2 STA, 3 AP-LR, 4 ESP-NOW AIR, 5 ESP-NOW GND, 6 BLE [2](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/configuration)
 - **Сериализация:** `SERIAL_TEL_PROTO`: 1 MSP/LTM, 4 MAVLink, 5 Transparent (любой байтовый поток)
-- **Сеть:** TCP 5760, UDP 14550, внутренний multicast 232.10.11.12:1606 для телеметрии, HTTP REST.
+- **Сеть в Wi-Fi режимах:** TCP 5760, UDP 14550; служебный multicast 232.10.11.12:1606 используется в AP-LR/STA для RSSI; HTTP REST включён не во всех режимах.
 - **Шифрование:** WPA2 PSK в Wi-Fi, AES-GCM 256 в ESP-NOW (соль `GenSalt147894562`, PBKDF2-SHA256 10k итераций — см. `db_esp_now.c`).
 - **Frontend:** `frontend/` собирается в один `index.html` с inline CSS/JS (специально, чтобы веб-сервер не грузил пачку файлов).
-- **Партиции:** `partitions.csv` → `factory @ 0x10000 1536K` + `spiffs www 0x30000`. **OTA-партиций нет**. Для OTA придётся менять таблицу.
+- **Партиции:** `partitions.csv` → `factory @ 0x10000 1536K` + `spiffs www size 0x30000`. **OTA-партиций нет**. Для OTA придётся менять таблицу.
 
 **Документация:** [Quick Start](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/quick-start) [3](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/quick-start), [Overview](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/untitled) [1](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/untitled), [Configuration](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/configuration) [2](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/configuration).
 
@@ -49,14 +47,14 @@
 
 **Рекомендация для MVP — A → B.**
 
-- **MVP (1 неделя):** оставь DroneBridge untouched, датчик шлёт в UART строку `{"id":"kitchen","t":22.4,"h":58}\n`. На GND-стороне (ESP32-GND в STA или малина) висит tiny Python/Go шлюз: слушает TCP 5760 / UDP 14550, парсит и паблишит в MQTT (`home/sensors/<id>`). Так делают Swarm-гайды DroneBridge — ESP-NOW ноды стекаются к одной GND-шлюзу [6](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/drone-swarm-control).
-- **Следующий шаг — B:** добавь свой сенсор-драйвер как отдельный компонент `components/sensor_hub/`. В `app_main()` после `db_start_control_module()` запускай `xTaskCreate(sensor_task, ...)`. Сенсор-таск с интервалом 1–5с читает BME280/DS18B20 и форматирует. Для публикации используй существующие `db_send_to_all_*` — они уже умеют резать на `DB_ESPNOW_PAYLOAD_MAXSIZE` (~200 байт).
+- **MVP (1 неделя):** оставь DroneBridge untouched, датчик шлёт в UART строку `{"id":"kitchen","t":22.4,"h":58}\n`. В режиме ESP-NOW GND отдаёт данные через UART; внешний шлюз слушает UART, а не TCP/UDP. Если вместо этого используется обычный Wi-Fi AP/STA, шлюз может слушать TCP 5760/UDP 14550. ESP-NOW GND не работает одновременно как STA/AP с IP-сокетами в текущем коде. Так делают Swarm-гайды DroneBridge — ESP-NOW ноды стекаются к одной GND-шлюзу [6](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/drone-swarm-control).
+- **Следующий шаг — B:** добавь свой сенсор-драйвер как отдельный компонент `components/sensor_hub/`. В `app_main()` после `db_start_control_module()` запускай `xTaskCreate(sensor_task, ...)`. Сенсор-таск с интервалом 1–5с читает BME280/DS18B20 и форматирует. Для передачи из своей задачи используй `db_send_to_all_radio_clients()` (дождись инициализации ESP-NOW очередей); она режет на `DB_ESPNOW_PAYLOAD_MAXSIZE` (215 байт), **без протокола сборки и подтверждения**.
 
 > Важно: `DB_SERIAL_PACK_SIZE_MAX = 1023`, `SERIAL_PACK_SIZE` по умолчанию 576, `serial_timeout` 20мс. Для сенсорного JSON ставь `pack_size=128–256` и `proto=Transparent` — иначе MAVLink-парсер будет ждать валидный фрейм и дропать.
 
 **Вывод в MQTT — два места:**
 
-1. **На GND-шлюзе (рекомендовано):** один MQTT-клиент на всех. Плюс — ноды остаются ultra-low-power, могут жить в ESP-NOW без Wi-Fi инфры.
+1. **Внешний шлюз за UART ESP-NOW GND (рекомендовано для MVP):** один MQTT-клиент на всех. Для однокристального GND+MQTT нужен отдельный дизайн Wi-Fi/ESP-NOW coexistence (ESP-NOW и STA должны работать на одном канале), которого эта прошивка не предоставляет.
 2. **На каждой ноде (STA):** добавляешь `esp-mqtt` (сейчас в `sdkconfig.defaults` выключен: `CONFIG_MQTT_PROTOCOL_311=n`). Включаешь `CONFIG_MQTT_PROTOCOL_311=y`, `CONFIG_MQTT_TRANSPORT_SSL=y` если нужен TLS, добавляешь в Kconfig. Пример публикации:
 ```c
 esp_mqtt_client_handle_t mqtt = esp_mqtt_client_init(&(esp_mqtt_client_config_t){
@@ -72,7 +70,7 @@ esp_mqtt_client_publish(mqtt, "home/sensors/kitchen", json, 0, 1, 0);
 
 **Что есть сейчас:**
 
-- 27 параметров в NVS (`db_parameters.h: DB_PARAM_TOTAL_NUM 27`), доступны через `GET/POST /api/settings` (JSON) и через MAVLink `PARAM_*` (только 18 числовых, строковые — только REST).
+- 27 параметров в NVS (`db_parameters.h: DB_PARAM_TOTAL_NUM 27`), доступны через `GET/POST /api/settings` (JSON, только режимы с HTTP) и через MAVLink `PARAM_*` (только 18 числовых, строковые — только REST).
 - Валидация в `db_param_is_valid_*`, персистенс `db_write_settings_to_nvs()` → `esp_restart()`.
 - Веб-форма на `/` сохраняет всё разом.
 
@@ -98,35 +96,13 @@ if(cJSON_IsNumber(interval)) nvs_set_i32(handle,"interval_ms",interval->valueint
 
 ### 2.3 MQTT → broadcast управление
 
-**Сейчас DroneBridge уже broadcustит**, но наоборот: `UART → TCP/UDP/ESP-NOW`. Обратный путь `GCS → UART` тоже есть (`db_parse_mavlink_from_radio`, `xQueueReceive(db_uart_write_queue)`).
+Текущий путь ESP-NOW: `UART GND → db_send_to_all_radio_clients() → зашифрованный ESP-NOW broadcast → очередь на AIR → UART AIR`. В обратном направлении AIR → GND аналогично. MQTT-клиента, IP-сокета и HTTP-сервера в режиме ESP-NOW **нет** (`main/main.c`, ветки старта режимов). Поэтому отправить UDP с Raspberry Pi в IP ESP-NOW-GND невозможно. Wi-Fi AP/STA и ESP-NOW AIR/GND — альтернативные режимы, не последовательные звенья одной сети.
 
-**Хочешь `MQTT → broadcast → ноды`:**
+Для **Hybrid Core**: на GND в `main/` подключить MQTT к брокеру потребует спроектировать работу STA+ESP-NOW на одном канале и жизненный цикл Wi-Fi; простой `mqtt_task` без изменения `db_init_wifi_espnow()` не заработает. Более простой путь: мост MQTT↔UART на внешнем хосте, а в прошивке AIR добавить перехват команд в `control_module_esp_now()` перед `write_to_serial()`; маршрутизировать по application-level `node_id`, сделать `req_id`, ACK, дедупликацию и таймаут. Никакого прямого unicast-переключения в коде нет.
 
-- **Wiring:** `MQTT брокер → GND-шлюз (подписчик) → DroneBridge broadcast → все AIR ноды → UART/реле`.
-- **Реализация:**
-  1. На GND (STA или AP) запускаешь MQTT-подписчика (Python на малине или `esp-mqtt` на ESP32-GND).
-  2. На сообщение в `home/actuators/#` вызываешь `db_send_to_all_clients(tcp, udp, payload, len)` или, в ESP-NOW GND, `db_send_to_all_espnow()`.
-  3. На AIR ноде твой сенсор-таск ловит данные из `db_uart_write_queue` (если proto=Transparent — просто `write_to_serial()` приходит извне, но тебе нужно перехватить). Проще — в `control_module_esp_now()` ветка `else // transparent` уже делает `write_to_serial()`. Добавь хук: если payload — твой командный JSON (`{"cmd":"relay","val":1}`), не пиши в UART, а дёргай GPIO.
+`db_send_to_all_radio_clients()` делит длинные сообщения на фрагменты до 215 байт, **но приёмник не собирает их обратно**. Отдельно код GND ведёт таблицу **19 записей метрик** по MAC (RSSI/потери) — это предел одного служебного пакета, **не лимит ESP-NOW-подключений**. Данные от последующих узлов всё равно принимаются и передаются в UART (если хватает эфира/очереди), но качество для них не отслеживается. См. `main/db_esp_now.c:update_peer_list`, `db_espnow_process_rcv_data`.
 
-**Важные нюансы ESP-NOW:**
-
-- В ESP-NOW каждый пакет шифруется и идёт broadcast (`FF:FF:FF:FF:FF:FF`). Лимит `ESP_NOW_MAX_DATA_LEN - IV - TAG - header = ~200 байт` (см. `DB_ESPNOW_PAYLOAD_MAXSIZE`). Большие JSON режутся автоматически в `db_send_to_all_clients()`, но лучше держать команду <200 байт.
-- ESP-NOW GND хранит до 19 пиров (`DB_ESPNOW_MAX_BROADCAST_PEERS 19` [db_espnow_limits.h]). Для дома хватит.
-- В текущей прошивке AIR→AIR форвард по умолчанию выключен, включается галкой `Forward MAVLink from other AIR` + `DB_PARAM_ESPNOW_AIR2AIR`. Для домашней сетки удобнее star: все AIR шлют в GND, GND ретранслирует. Если нужен mesh AIR↔AIR — включи галку, но помни про шторм.
-
-**Готовая схема MVP без правки прошивки:**
-
-```
-[HomeAssistant / Node-RED] --MQTT publish "home/relay/kitchen/set ON"--> [Raspberry Pi GND: mqtt_to_udp.py] --UDP 14550--> [ESP32 AP (DroneBridge)] --WiFi/ESP-NOW--> [ESP32 AIR датчики] --> GPIO relay
-```
-
-`mqtt_to_udp.py` 15 строк:
-```python
-import paho.mqtt.client as mqtt, socket
-sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-def on_message(c,u,m): sock.sendto(m.payload, ("192.168.2.1",14550))
-mqtt.Client().on_message=on_message; mqtt.Client().connect("192.168.1.10"); mqtt.Client().subscribe("home/actuators/#"); mqtt.Client().loop_forever()
-```
+Текущая галка AIR→AIR — только для MAVLink, не mesh-маршрутизатор и не механизм ретрансляции Transparent-команд.
 
 ### 2.4 Скрещивание DroneBridge движка + своё ядро
 
@@ -140,18 +116,18 @@ mqtt.Client().on_message=on_message; mqtt.Client().connect("192.168.1.10"); mqtt
 
 **Вариант 1 — “Тонкий мост” (рекомендован для старта):** не трогать DroneBridge, свой код — отдельный процесс на GND-шлюзе (малина/второй ESP). DroneBridge остаётся чистым радиомостом. Плюс: 0 риска сломать радио, обновления DroneBridge накатываешь штатно. Минус: +1 железка.
 
-**Вариант 2 — “Hybrid Core” (оптимальный среднесрок):** форк `main/` + свой компонент `components/homeauto_core/`. Свой core — FreeRTOS-таски `sensor_task`, `actuator_task`, `mqtt_task` с очередями. Общение с DroneBridge через уже существующие `db_send_to_all_radio_clients()` и `db_uart_write_queue`. Важно не трогать Wi-Fi init (там `esp_netif_create_default_wifi_ap`, `esp_wifi_init`), а добавить `sensor_task` после. Память: ESP32-C3 ~320KB SRAM, DroneBridge ест ~80KB, остаётся ~100KB под тебя — хватит на BME280 + MQTT без TLS. С TLS бери C6/S3.
+**Вариант 2 — “Hybrid Core” (оптимальный среднесрок):** форк `main/` + свой компонент `components/homeauto_core/`. Свой core — FreeRTOS-таски `sensor_task`, `actuator_task`, `mqtt_task` с очередями. Общение с DroneBridge через уже существующие `db_send_to_all_radio_clients()` и `db_uart_write_queue`. Важно не трогать Wi-Fi init (там `esp_netif_create_default_wifi_ap`, `esp_wifi_init`), а добавить `sensor_task` после. Доступная RAM и нагрузка зависят от платы/сборки — измерить heap high-water mark и размеры стека на устройстве, не закладывать фиксированные цифры без замера. MQTT через STA в ESP-NOW режиме потребует доработки радиослоя и общей настройки канала.
 
 **Вариант 3 — “Fork + рефактор”:** вынести DroneBridge в либу `libdronebridge.a` и писать свой `app_main`. Долго, но чисто для продукта. Требует понимания `idf.py set-target` и `Kconfig.projbuild`.
 
 **Практические правила гибрида:**
 
-- Создай ветку от `master`, не от `arena/...` с ограничениями AGENTS.md. AGENTS.md в этой арене запрещает OTA/C5/5.5/DLSE-фичи — для домашней автоматики это ок, но имей в виду.
+- Работа в этом репозитории остаётся в текущей ветке `arena/f7b2024a-dronebridge-for-esp32-arduino`. Локальные `AGENTS.md` исключают добавление OTA/C5/IDF 5.5+; OTA здесь обсуждается только как отдельный архитектурный вариант, без реализации.
 - Не меняй `CONFIG_LWIP_MAX_SOCKETS=16` и `max_uri_handlers=9` без нужды.
-- Сенсор-таски — низкий приоритет (1-2), Control — 5-6, иначе потеряешь пакеты.
-- Используй `esp_timer` для опроса, а не `vTaskDelay` в горячем цикле — смотри как сделаны `db_timer_start_mavlink_heartbeat()`.
+- Сенсор-таски — низкий приоритет (например 2), Control и ESP-NOW в текущем коде — приоритет 5; проверить на плате загрузку и потери.
+- Для периодического опроса сенсоров достаточно `vTaskDelayUntil`; не блокируй Wi-Fi callback и существующие control/espnow tasks. Текущие MAVLink таймеры реализованы FreeRTOS software timers.
 
-Пример врезки своей задачи:
+Схематичный пример врезки своей задачи (не готовая сборка; требуется инициализация датчиков/очередей и обработка ошибок):
 ```c
 // в app_main() после db_start_control_module()
 xTaskCreate(sensor_poll_task, "sensor", 4096, NULL, 2, NULL);
@@ -187,53 +163,29 @@ _Noreturn void sensor_poll_task(void *a){
 python batch_ota_update_allinone.py --release-folder DroneBridge_ESP32DLSE_BETA4 --subnetmask 192.168.1.0/24 --target-version 1.0.0-beta.3
 ```
 
-**Если OTA нужен в open-source — придётся дописать самому (обычные ESP32-практики):**
-
-- **Партиции:** замени `partitions.csv` на OTA-схему: `factory, ota_0, ota_1, www, nvs`. Пример на 4MB flash:
-```
-nvs,data,nvs,0x9000,0x6000
-otadata,data,ota,0xf000,0x2000
-phy_init,data,phy,0x11000,0x1000
-factory,app,factory,0x20000,1M
-ota_0,app,ota_0,,1M
-ota_1,app,ota_1,,1M
-www,data,spiffs,,0x30000
-```
-- **Компонент:** включи `CONFIG_HTTP_SERVER` + `app_update`, добавь HTTP хендлер `POST /api/ota` который пишет в `esp_ota_begin/write/end/set_boot_partition`. Или используй готовый `esp_https_ota` / `ArduinoOTA` (порт 3232, `ArduinoOTA.handle()` в `loop()`).
-- **Безопасность:** OTA только по WPA2/STA или локальному AP, обязательно `CONFIG_SECURE_BOOT` + пароль на `/api/ota`. Не катай OTA в ESP-NOW — там нет TCP.
-- **Процедура OTA “по-домашнему”:** GND-нода в STA качает `.bin` с твоего сервера, сама перепрошивается по `esp_https_ota`, потом ретранслирует бинарник AIR-нодам по HTTP (AIR должны временно поднять AP/STA). Сложно, поэтому для дома проще: AIR-ноды шьются по USB раз в квартал, а логика обновляется как скрипты-профили через REST без перепрошивки.
+**Для отдельного продукта с OTA** нужно проектировать корректную OTA-разметку под фактический объём flash и размер приложения (проверять CSV генератором IDF на пересечения/выравнивание), две app-ячейки, `otadata`, а также авторизованный механизм доставки, проверки подписи/хэша, rollback и восстановления питания. Нельзя переносить приведённую ранее черновую таблицу партиций: её смещения пересекались. Это **не реализовано** в открытой прошивке и не будет добавляться в данный репозиторий (см. `AGENTS.md`). Обновление AIR через ESP-NOW потребовало бы отдельного chunk/ACK/resume протокола; HTTP по IP в существующем ESP-NOW режиме отсутствует.
 
 **Вывод:** для быстрого старта OTA не делай — используй флешер + профили. Для продукта заложи OTA-партиции сразу, но реализуй после MVP.
 
 ---
 
-## 3. Глюки и ограничения, которые ловили пользователи
+## 3. Проверяемые ограничения текущей реализации
 
-Из релизов и issues [1](https://github.com/DroneBridge/ESP32/releases) [5](https://githubhelp.com/DroneBridge/ESP32):
-
-- **Рестарт AP не дерегает клиентов** — клиенты думают что связаны, нужен рестарт клиента или оффлайн AP >3с.
-- **MAVLink-парсинг теряет ~0.5 пакета/с** — из-за неотвеченных сообщений GCS→ESP32. Для прозрачного режима это не критично, для прозрачного домашнего JSON ставь `Transparent`.
-- **Веб-интерфейс открывает новую вкладку при Save** (старые баги), лечится power-cycle после сохранения.
-- **TCP/UDP “connection refused”** — часто из-за несовпадения `wifi_pass`/`espnow_secret` или `max packet size` >250 в ESP-NOW.
-- **USBSerial flavour** — для флеша нужно зажать BOOT при подаче питания, иначе флешер не видит плату [4](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32/installation).
-- **LR/ESP-NOW невидим для обычных устройств** — обязательно имей план возврата: короткое нажатие BOOT → AP `dronebridge` / долгое → reset.
-
-Для дома самые болезненные: 19 пиров лимит, 200 байт на пакет, 192KB SPIFFS, отсутствие OTA и MQTT из коробки.
+- ESP-NOW LR = фиксированный радиоканал, без IP и без автоматического unicast/опроса.
+- 19 — размер таблицы RSSI/packet-loss в одном служебном кадре, а не максимум AIR-узлов.
+- Очереди по 6 элементов, нет прикладного ACK, повторной передачи и сборки разбитых сообщений.
+- Предел 215 байт полезного содержимого в одном ESP-NOW кадре при `ESP_NOW_MAX_DATA_LEN=250`.
+- Никаких подтверждённых измерений дальности/масштабирования именно этой сборки здесь не проводилось. Упоминания частных багов, нагрузок RAM и сроков в предыдущей версии отчёта были предположениями и удалены.
 
 ---
 
-## 4. Рекомендация “по-быстрому” (как сделать канал за выходные)
+## 4. Рекомендация для Hybrid Core
 
-**Цель:** опрос датчиков + MQTT + broadcast управление без форка.
-
-1. **Закажи 2× ESP32-C6 official HW** (лучшая дальность, RF-switch) или любые C3/S3 с USB-UART.
-2. **Прошей обе:** флешер → `Stable` → `ESP32-C6` → first boot в AP `dronebridge` → 192.168.2.1 → выставь `Transparent`, `pack_size 128`, `timeout 50ms`, пины TX/RX под свою разводку. Проверь в `WiFi Client`/`AP` (веб будет доступен), потом переведи в `ESP-NOW AIR` + `GND` с одинаковым `espnow_secret` (нажми Rotate на GND, скопируй на AIR).
-3. **Датчик-нода (AIR):** ESP32-AIR + BME280 по I²C + реле на GPIO. Прошивка — **не DroneBridge**, а ESPHome/Tasmota/твой Arduino-скетч, который пишет в UART в сторону DroneBridge? Нет — проще: датчик-нода = сам DroneBridge-AIR + твой сенсор-таск (если хочешь 1 чип) **или** две платы: сенсор-Arduino → UART → DroneBridge-AIR (transparent). Для выходных бери 2 платы, чтобы не форкать.
-4. **GND-шлюз:** малина/ноут в WiFi STA, подключается к AP DroneBridge *или* ESP32-GND в USBSerial → `mqtt_to_udp.py` (см. выше) + Node-RED → Home Assistant. Подписка `home/actuators/#` → UDP 14550.
-5. **Проверка:** `mosquitto_pub -t home/actuators/relay -m '{"id":"kitchen","val":1}'` → реле щёлкает.
-6. **Профили:** пока храни в Home Assistant, не в ноде. Когда нужно — добавь `POST /api/settings` с новым `interval_ms`.
-
-**Когда это взлетит — планируй форк с сенсор-таском и FS для профилей.**
+1. Выбрать железо и канал: тестировать пару ESP32-C3/C6; одинаковый канал и групповой `espnow_secret` на GND и AIR.
+2. В прошивке AIR добавить `sensor_task` и обработчик прикладных сообщений после проверки GCM, не забирать `db_uart_write_queue` вторым конкурентным consumer-ом.
+3. В GND выбрать одно из двух: внешний MQTT↔UART хост (проще и надёжнее) **или** отдельный инженерный этап STA+ESP-NOW coexistence на одном канале (одна ESP32, но меняется Wi-Fi init). Не предполагать доступность UDP 14550/REST из ESP-NOW режима.
+4. В payload использовать бинарный envelope `{version, type, node_id:uint32, req_id:uint32, length, body}`; всем широковещательный кадр, только адресат обрабатывает запрос; ответ адресован через `req_id` и `node_id` поверх такого же broadcast. ACK/таймаут/retry с разбросом задержек — собственный протокол, не штатная функция DroneBridge.
+5. Провести измерение пропускной способности, RSSI, packet-loss, свободной RAM и устойчивости при увеличении числа узлов. Не ориентироваться на «19 узлов максимум» — ограничения определяет эфир и код обработки.
 
 ---
 
@@ -241,16 +193,16 @@ www,data,spiffs,,0x30000
 
 | Этап | Что | Срок | Риск |
 |---|---|---|---|
-| **MVP 0** | 2× ESP32 + Transparent + GND MQTT шлюз на питоне | 1–2 дня | Низкий |
-| **MVP 1** | Форк, сенсор-таск I²C, REST `/api/profiles` (NVS) | 1–2 недели | Средний (память) |
-| **MVP 2** | FS для скриптов, `MQTT→ESP-NOW` внутри GND, GPIO-актуаторы | 2–3 недели | Средний |
-| **Продукт** | OTA-партиции + `POST /api/ota`, TLS MQTT, OTA-реле | 1–2 месяца | Высокий |
+| **MVP 0** | 2× ESP32 + Transparent + внешний GND UART↔MQTT шлюз | Оценивать по прототипу | Низкий |
+| **MVP 1** | Hybrid Core, сенсор-таск I²C, NVS-профили (REST только в Wi-Fi режиме) | Оценивать по прототипу | Средний |
+| **MVP 2** | При необходимости STA+ESP-NOW GND, QoS приложения, GPIO | Отдельный этап | Высокий |
+| **Продукт** | OTA только вне этого репозитория/по отдельному решению, надёжность и безопасность | Отдельный проект | Высокий |
 
 ---
 
 ## 6. Итог — стоит ли DroneBridge для дома?
 
-- **Да, если** нужен дальнобойный прозрачный мост без своей Wi-Fi инфры (дача, гараж 500м), мало нод (<19), трафик телеметрия (<10KB/с), и ты готов держать GND-шлюз.
+- **Да, если** нужен дальнобойный прозрачный мост без своей Wi-Fi инфры (дача, гараж 500м), трафик, проверенный экспериментально на своём канале, и ты готов держать GND-шлюз.
 - **Нет, если** нужна готовая экосистема датчиков/актуаторов, OTA из коробки, 100+ нод, Zigbee-экосистема — бери ESPHome + Zigbee2MQTT + LoRa (SX1262) или Wi-Fi mesh (ESP-MESH). DroneBridge — это всё-таки “телеметрия для дронов”, а не “умный дом”.
 
 Для твоей задачи “по быстрому придумать канал для домашней автоматики” DroneBridge — **отличный временный канал**, но **не платформа**. Используй его как есть (Transparent + шлюз), а параллельно смотри на ESPHome как на конечную.
@@ -267,5 +219,27 @@ cmake -S test -B build/test && ctest --test-dir build/test
 cd frontend && npm install && npm run build
 ```
 
-Дальше могу накидать `mqtt_to_udp` шлюз и патч `db_esp32_control.c` с хуком для домашних команд — скажи, какой путь (MVP 0 vs Hybrid) берём.
+Следующий шаг для Hybrid Core — прототип узла/шлюза и измерение радиоканала с адресацией и ACK на прикладном уровне.
 
+
+---
+
+## 8. Масштаб, опрос и OTA: DLSE ≠ ESP-NOW обычной прошивки
+
+**Проверено 2026-10-19:** [DLSE Overview](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32-drone-light-show-edition/overview-drone-light-show-edition) рисует **Skybrush Live → Ethernet → Wi-Fi AP → DLSE ESP32 (STA) → UART → flight controller**. [DLSE Configuration](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32-drone-light-show-edition/configuration) предлагает лишь AP/STA, для шоу обычно STA. Это отдельная коммерческая прошивка, не код этого репозитория. Сайт [DLSE](https://drone-bridge.com/dlse/) говорит об эксплуатации флотов 1000+, но **не подтверждает 10 000 узлов на одном AP/частоте, ни опрос пачками по 19**. Wi-Fi 6/OFDMA на поддерживаемых устройствах и планирование AP/каналов — другая архитектура, чем ESP-NOW LR.
+
+| Слой | Открытая прошивка: ESP-NOW AIR/GND | DLSE (по открытой документации/Support Suite) |
+|---|---|---|
+| Радио | ESP-NOW + LR, один настроенный канал, без ассоциации с AP | Wi-Fi STA каждого устройства ↔ инфраструктурные AP; AP режим для настройки |
+| Адресация | `esp_now_send(FF:FF:FF:FF:FF:FF)`; `origin` GND/AIR, физический source MAC, **нет target node ID** | IP-адрес узла; MAVLink sysid/component id внутри телеметрии |
+| Сбор телеметрии | AIR самостоятельно отдаёт UART-данные; GND принимает; нет опросчика | FC передаёт MAVLink → DLSE bridge → UDP/TCP через AP → GCS; политика расписания FC/Skybrush не установлена по открытым исходникам DLSE |
+| Сервисная телеметрия | GND периодически вещает *один список* MAC/RSSI/loss до 19 записей; AIR выбирает себя по MAC | MAVLink `RADIO_STATUS`, прочие параметры/HTTP stats; точный закрытый radio runtime не аудитирован |
+| OTA | отсутствует | отдельная Wi-Fi/IP-процедура: MAVLink broadcast для discovery → HTTP GET `/api/system/info` → HTTP POST binary `/update/www`, затем `/update/firmware` по IP каждого узла |
+
+**Важно про 19:** `main/db_espnow_limits.h` ограничивает **массив метрик** для одного служебного пакета (тип `DB_ESP_NOW_PACKET_TYPE_INTERNAL_TELEMETRY`), не адресное пространство и не количество установленных «соединений». Приём DATA не отвергает узел при переполнении списка; сохраняются ограничения ёмкости эфира/очередей/памяти. Нет ни последовательного обхода по 19, ни переключения на отдельный радиоканал для ответа: в `main/main.c:465–485` канал фиксирован, в `main/db_esp_now.c:219` инициализируется единственный broadcast peer. ESP-NOW callback об отправке не равен прикладному ACK у адресата.
+
+**Пример `#1042, канал 8`:** канал 8 в `esp_wifi_set_channel(8, ...)` — общая радиочастота всей группы, не выделенный сеанс. MAVLink `sysid` 8-битный: `1042` не может быть MAVLink SYS ID; для своего протокола введи `uint32_t node_id`, который проверяет каждый узел *после* общей аутентификации пакета. На том же канале узел 1042 ответит с `req_id`; остальные промолчат. Без временных окон/jitter при одновременных ответах получишь коллизии. Для большого флота нужна сегментация по AP/радиоканалам и телеметрийный бюджет, а не магическое масштабирование через broadcast.
+
+**Проверяемые детали OTA DLSE:** открытый [`batch_ota_update_allinone.py`](https://github.com/DroneBridge/DLSECommercialSupportSuite/blob/main/batch_ota_update_allinone.py) делает discovery и **поочередный** upload на найденные IP; [`DroneBridgeCommercialSupportSuite.py`](https://github.com/DroneBridge/DLSECommercialSupportSuite/blob/main/DroneBridgeCommercialSupportSuite.py) отправляет по UDP broadcast MAVLink `HEARTBEAT` + `COMMAND_LONG(MAV_CMD_REQUEST_MESSAGE, AUTOPILOT_VERSION=148)` на порт 14555; слушает 14550, фильтрует `comp_id=240`. Затем двоичные `www.bin` и `db_esp32.bin` передаются `POST /update/www` и `POST /update/firmware` **обычным HTTP по IP**, это не MAVLink-бинарник и не ESP-NOW. [`OpenAPI`](https://github.com/DroneBridge/DLSECommercialSupportSuite/blob/main/api_definition/openapi_definition.yaml) описывает эти endpoints. Реализация приёма OTA на DLSE стороне закрыта, поэтому точный внутренний механизм проверки/rollback по этому проекту не доказан. [Safety guideline](https://dronebridge.gitbook.io/docs/dronebridge-for-esp32-drone-light-show-edition/safety-and-integration-guideline) запрещает обновление вооружённого/летящего дрона; отдельно отмечает ограничения проверки состояния FC при потере MAVLink.
+
+**Оценка масштаба только как sanity check:** при 10 000 узлов и *одном* сообщении 50 байт в секунду это **4 Мбит/с только данных** (без MAC/преамбулы/коллизий). Для ESP-NOW LR порядка 250 кбит/с *gross* это физически не поместится на одном канале. Wi-Fi-инфраструктура с несколькими AP/каналами и расписанием может масштабироваться, но точные числа допустимых узлов и режимы Skybrush нужно измерять на реальной сети, не выводить из 19-элементной таблицы ESP-NOW.
